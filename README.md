@@ -1,4 +1,7 @@
 # Point-LIO-ROS2 (with Unitree Unilidar L1/L2 support)
+## Fork Changes
+This fork implements the changes discussed in [Issue #7](https://github.com/dfloreaa/point_lio_ros2/issues/7) of the original repo. Without these changes, this package does not work with the Livox Mid-360 scanner.
+
 ## Point-LIO: Robust High-Bandwidth Lidar-Inertial Odometry
 
 *(Pay attention to modifying the parameters for IMU in .yaml file, according to the IMU you use.)*
