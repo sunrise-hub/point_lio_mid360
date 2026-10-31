@@ -714,6 +714,10 @@ int main(int argc, char **argv) {
     auto nh = std::make_shared<rclcpp::Node>("laserMapping");
     readParameters(nh);
     cout << "lidar_type: " << lidar_type << endl;
+    cout << "preprocess: scan_line=" << p_pre->N_SCANS
+         << " point_filter_num=" << p_pre->point_filter_num
+         << " blind=" << p_pre->blind
+         << " max_iter=" << max_iter << endl;
 
     path.header.stamp = get_ros_time(lidar_end_time);
     path.header.frame_id = odom_header_frame_id;
@@ -746,6 +750,10 @@ int main(int argc, char **argv) {
 
     kf_input.init_dyn_share_modified(get_f_input, df_dx_input, h_model_input);
     kf_output.init_dyn_share_modified_2h(get_f_output, df_dx_output, h_model_output, h_model_IMU_output);
+    // 必须在 init_* 之后设置：init 里会把 maximum_iter 重置为 1
+    kf_input.set_maximum_iter(max_iter);
+    kf_output.set_maximum_iter(max_iter);
+    RCLCPP_INFO(logger, "IEKF maximum_iter = %d", kf_output.get_maximum_iter());
     Eigen::Matrix<double, 24, 24> P_init = MD(24, 24)::Identity() * 0.01;
     P_init.block<3, 3>(21, 21) = MD(3, 3)::Identity() * 0.0001;
     P_init.block<6, 6>(15, 15) = MD(6, 6)::Identity() * 0.001;

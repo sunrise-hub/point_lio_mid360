@@ -23,7 +23,8 @@ def generate_launch_description():
             'prop_at_freq_of_imu': True,
             'check_satu': True,
             'init_map_size': 10,
-            'point_filter_num': 3,  # Options: 1, 3
+            'point_filter_num': 3,  # Options: 1, 3, 4, 5（每 N 个点取 1 个，线性影响 CPU）
+            'max_iter': 2,  # 每次量测更新的 iEKF 迭代次数（1 = 单次 EKF；2 = 多一轮重线性化）
             'space_down_sample': True,
             'filter_size_surf': 0.5,  # Options: 0.5, 0.3, 0.2, 0.15, 0.1
             'filter_size_map': 0.5,  # Options: 0.5, 0.3, 0.15, 0.1

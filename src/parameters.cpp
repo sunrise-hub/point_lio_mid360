@@ -12,6 +12,7 @@ std::string lid_topic, imu_topic;
 bool prop_at_freq_of_imu, check_satu, con_frame, cut_frame;
 bool use_imu_as_input, space_down_sample, publish_odometry_without_downsample;
 int init_map_size, con_frame_num;
+int max_iter;
 double match_s, satu_acc, satu_gyro, cut_frame_time_interval;
 float plane_thr;
 double filter_size_surf_min, filter_size_map_min, fov_deg;
@@ -43,6 +44,10 @@ void readParameters(shared_ptr<rclcpp::Node> &nh) {
     nh->declare_parameter<bool>("use_imu_as_input", true);
     nh->declare_parameter<bool>("check_satu", true);
     nh->declare_parameter<int>("init_map_size", 100);
+    // 每次量测更新的 Gauss-Newton 迭代次数；1 = 单次 EKF 更新（与旧行为一致）。
+    // 代码默认保持 1，保证其它 lidar 的 launch 不受影响；
+    // 本项目在 mapping_mid360.launch.py 里显式设为 2。
+    nh->declare_parameter<int>("max_iter", 1);
     nh->declare_parameter<bool>("space_down_sample", true);
     nh->declare_parameter<double>("mapping.satu_acc", 3.0);
     nh->declare_parameter<double>("mapping.satu_gyro", 35.0);
@@ -103,6 +108,7 @@ void readParameters(shared_ptr<rclcpp::Node> &nh) {
     nh->get_parameter("use_imu_as_input", use_imu_as_input);
     nh->get_parameter("check_satu", check_satu);
     nh->get_parameter("init_map_size", init_map_size);
+    nh->get_parameter("max_iter", max_iter);
     nh->get_parameter("space_down_sample", space_down_sample);
     nh->get_parameter("mapping.satu_acc", satu_acc);
     nh->get_parameter("mapping.satu_gyro", satu_gyro);

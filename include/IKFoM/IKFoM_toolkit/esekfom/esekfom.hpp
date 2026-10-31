@@ -130,6 +130,19 @@ public:
 		x_.build_SEN_state();
 	}
 
+	// 设置每次量测更新里 Gauss-Newton 的迭代次数。
+	// 必须在 init_dyn_share_modified*() 之后调用（那两处会把 maximum_iter 重置为 1）。
+	// 每次迭代都会重新计算 h(x)（含重新投影与近邻搜索），CPU 开销与迭代次数近似成正比。
+	void set_maximum_iter(int iters)
+	{
+		maximum_iter = (iters > 0) ? iters : 1;
+	}
+
+	int get_maximum_iter() const
+	{
+		return maximum_iter;
+	}
+
 	// iterated error state EKF propogation
 	void predict(double &dt, processnoisecovariance &Q, const input &i_in, bool predict_state, bool prop_cov){
 		if (predict_state)
@@ -280,6 +293,11 @@ public:
 			// 	}
 			// }
 			// if(n > dof_Measurement)
+			// 协方差只在最后一次迭代更新：
+			//  - 多次迭代时，若每轮都收缩 P，会让 P 在同一个量测上被收缩多次而过度乐观，
+			//    且下一轮的 K 会基于已收缩的 P，偏离标准 Gauss-Newton（应为固定先验 P）。
+			//  - maximum_iter == 1 时 i == 0 即最后一次，行为与原来完全一致。
+			if (i == maximum_iter - 1)
 			{
 				P_ = P_ - K_*h_x*P_. template block<12, n>(0, 0);
 			}
@@ -323,7 +341,11 @@ public:
                                     
             Matrix<scalar_type, n, 1> dx_ = K * z; 
 
-            P_ -= K * HP;
+            // 同 update_iterated_dyn_share_modified：协方差只在最后一次迭代更新
+            if (i == maximum_iter - 1)
+            {
+                P_ -= K * HP;
+            }
 			x_.boxplus(dx_);
 		}
 		return;

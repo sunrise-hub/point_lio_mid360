@@ -1,5 +1,7 @@
 #include "preprocess.h"
 
+#include <cmath>
+
 #define RETURN0     0x00
 #define RETURN0AND1 0x10
 
@@ -98,6 +100,8 @@ void Preprocess::avia_handler(const livox_ros_driver2::msg::CustomMsg::SharedPtr
     pl_full.resize(plsize);
 
     uint valid_num = 0;
+    float prev_kept_curv = 0.0f;
+    bool has_prev_kept = false;
 
     for (uint i = 1; i < plsize; i++) {
         if ((msg->points[i].line < N_SCANS) &&
@@ -108,19 +112,34 @@ void Preprocess::avia_handler(const livox_ros_driver2::msg::CustomMsg::SharedPtr
                 pl_full[i].y = msg->points[i].y;
                 pl_full[i].z = msg->points[i].z;
                 pl_full[i].intensity = msg->points[i].reflectivity;
-                pl_full[i].curvature = msg->points[i].offset_time /
-                                       float(1000000); // use curvature as time of each laser points, curvature unit: ms
 
-                if (i == 0) pl_full[i].curvature = fabs(pl_full[i].curvature) < 1.0 ? pl_full[i].curvature : 0.0;
-                else pl_full[i].curvature =
-                             fabs(pl_full[i].curvature - pl_full[i - 1].curvature) < 1.0 ? pl_full[i].curvature :
-                             pl_full[i - 1].curvature + 0.004166667f;
+                // curvature = 该点相对帧头的时间（ms）。以"上一个被保留的点"为参考做连续性检查：
+                // 原实现取 pl_full[i-1]，但 point_filter_num > 1 时该索引大多未被赋值（=0），
+                // 导致帧内偏移 ≥ 1 ms 的点全部退化成同一个 0.0041667 ms，
+                // 整帧在 time_compressing 里塌缩成一个时间组：
+                //   · 丢失"逐点用自己的时间戳预测"的语义；
+                //   · 量测矩阵变成 N×N，K 求解从 O(N) 退化为 O(N³)。
+                const float curv = msg->points[i].offset_time / float(1000000);
+                float cur_curv = curv;
+                if (has_prev_kept && std::fabs(curv - prev_kept_curv) >= 1.0f) {
+                    cur_curv = prev_kept_curv + 0.004166667f;  // 保持原兜底语义：时间跳变时前进一个点周期
+                }
+                pl_full[i].curvature = cur_curv;
+                prev_kept_curv = cur_curv;
+                has_prev_kept = true;
 
-                if ((abs(pl_full[i].x - pl_full[i - 1].x) > 1e-7)
-                    || (abs(pl_full[i].y - pl_full[i - 1].y) > 1e-7)
-                    || (abs(pl_full[i].z - pl_full[i - 1].z) > 1e-7)
-                       && (pl_full[i].x * pl_full[i].x + pl_full[i].y * pl_full[i].y + pl_full[i].z * pl_full[i].z >
-                           (blind * blind))) {
+                // 丢弃盲区内的点（与 velodyne/unilidar 分支保持同一判据），
+                // 同时保留"与上一个保留点完全相同则跳过"的去重逻辑。
+                // 注意：原写法 `A || B || (C && D)` 因 && 优先级高于 ||，
+                // 只要 x 或 y 变化就会绕过 blind 判据，导致盲区过滤形同虚设。
+                const float range2 = pl_full[i].x * pl_full[i].x +
+                                     pl_full[i].y * pl_full[i].y +
+                                     pl_full[i].z * pl_full[i].z;
+                const bool moved =
+                    (std::fabs(pl_full[i].x - pl_full[i - 1].x) > 1e-7f) ||
+                    (std::fabs(pl_full[i].y - pl_full[i - 1].y) > 1e-7f) ||
+                    (std::fabs(pl_full[i].z - pl_full[i - 1].z) > 1e-7f);
+                if (moved && range2 > blind * blind) {
                     pl_surf.push_back(pl_full[i]);
                 }
             }
