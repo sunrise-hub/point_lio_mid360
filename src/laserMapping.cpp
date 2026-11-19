@@ -741,17 +741,27 @@ template<typename T>
 void set_twist(T &out) {
     // 输出模式：线速度来自状态 vel，角速度来自状态 omg
     if (!use_imu_as_input) {
-        out.linear.x = kf_output.x_.vel(0);
-        out.linear.y = kf_output.x_.vel(1);
-        out.linear.z = kf_output.x_.vel(2);
+        /*
+        第一步：读取姿态 kf_output.x_.rot 它是 SO3 旋转对象，底层继承了 Eigen 四元数类型，表示 IMU 系到世界系 的旋转
+        第二步：取得归一化的姿态 .normalized()  返回归一化后的四元数值，确保它适合表示旋转。
+        第三步：转换成旋转矩阵，再取转置  toRotationMatrix().transpose() toRotationMatrix()：得到一个 3×3 旋转矩阵，方向是 IMU 系 → 世界系。transpose()：取矩阵转置；对于旋转矩阵，这就是逆变换，方向变为世界系 → IMU 系。
+        第四步：转换速度 * kf_output.x_.vel 将世界系速度转换成 IMU 系表达。
+        */ 
+        const V3D velocity_body =
+            kf_output.x_.rot.normalized().toRotationMatrix().transpose() * kf_output.x_.vel;
+        out.linear.x = velocity_body(0);
+        out.linear.y = velocity_body(1);
+        out.linear.z = velocity_body(2);
         out.angular.x = kf_output.x_.omg(0);
         out.angular.y = kf_output.x_.omg(1);
         out.angular.z = kf_output.x_.omg(2);
     } else {
         // 输入模式：线速度来自状态 vel，角速度直接取最近一帧 IMU 读数
-        out.linear.x = kf_input.x_.vel(0);
-        out.linear.y = kf_input.x_.vel(1);
-        out.linear.z = kf_input.x_.vel(2);
+        const V3D velocity_body =
+            kf_input.x_.rot.normalized().toRotationMatrix().transpose() * kf_input.x_.vel;
+        out.linear.x = velocity_body(0);
+        out.linear.y = velocity_body(1);
+        out.linear.z = velocity_body(2);
         out.angular.x = imu_last.angular_velocity.x;
         out.angular.y = imu_last.angular_velocity.y;
         out.angular.z = imu_last.angular_velocity.z;
@@ -764,6 +774,8 @@ void set_twist(T &out) {
 // - 同时广播 camera_init -> aft_mapped 的 TF。
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr &pubOdomAftMapped,
                       std::shared_ptr<tf2_ros::TransformBroadcaster> &tf_br) {
+
+    // 可以看看/opt/ros/humble/share/nav_msgs/msg/Odometry.msg的消息定义 有header pose ；child_frame_id twist(速度估计及其协方差，在；child_frame_id系下！)
 
     // 设置 odom 的父系/子系：camera_init -> aft_mapped
     odomAftMapped.header.frame_id = odom_header_frame_id;
@@ -778,7 +790,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
 
     // 从滤波器状态填充位姿和速度
     set_posestamp(odomAftMapped.pose.pose);
-    set_twist(odomAftMapped.twist.twist);
+    set_twist(odomAftMapped.twist.twist);  // 填充速度
 
     if (odom_only){
         // odom_only 模式额外填充协方差，供下游做融合
@@ -1131,9 +1143,10 @@ int main(int argc, char **argv) {
 
             t2 = omp_get_wtime();
 
-            /*** iterated state estimation ***/
-            crossmat_list.reserve(feats_down_size);
-            pbody_list.reserve(feats_down_size);
+            /*** iterated state estimation ***/ 
+            // reserve() 只分配容量，不创建元素 后面直接用[i]写入可能会出现问题 应该改为resize 
+            crossmat_list.resize(feats_down_size);
+            pbody_list.resize(feats_down_size);
             // pbody_ext_list.reserve(feats_down_size);
 
             for (size_t i = 0; i < feats_down_body->size(); i++) {

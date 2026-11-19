@@ -733,28 +733,18 @@ Point-LIO ROS2
      Estimator.cpp  h_model_output()
      IKFoM_toolkit/esekfom/esekfom.hpp  update_iterated_dyn_share_modified()
 
-3. 完全遮挡 LiDAR 时：
-   - 近距点会被 blind=0.1 过滤。
-   - 点云为空时 sync_packages() 会丢弃该帧。
-   - 这段时间没有 LiDAR 修正，IMU 数据会在队列中积压。
-   - 下一帧有效点云到来时，积压 IMU 会被补算，零偏会被二次积分，
-     可能出现明显位置漂移或跳变。
-   相关代码：
-     laserMapping.cpp  sync_packages()
-     laserMapping.cpp  main() 中逐点 predict/update 循环
-     preprocess.cpp    avia_handler()
 
-4. 部分遮挡时，手/手臂/衣物等近距离点可能参与匹配。
+3. 部分遮挡时，手/手臂/衣物等近距离点可能参与匹配。
    map_incremental() 当前会把当前帧下采样点写入地图，
    不区分该点是否通过平面匹配；动态遮挡物可能污染地图。
    相关代码：
      laserMapping.cpp  map_incremental()
      laserMapping.cpp  main() 中 map_incremental() 调用处
 
-5. 没有轮速/编码器接口。
+4. 没有轮速/编码器接口。
    遮挡、打滑、雷达脏污时没有第二运动信源。
 
-6. 参数修改入口：
+5. 参数修改入口：
    - 话题、外参、IMU 饱和值、blind、下采样：config/mid360.yaml
    - launch 覆盖参数：launch/mapping_mid360.launch.py
    - 预处理：src/preprocess.cpp
