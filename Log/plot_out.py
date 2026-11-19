@@ -66,8 +66,8 @@ lab_1 = ['gyr-x', 'gyr-y', 'gyr-z']
 lab_2 = ['acc-x', 'acc-y', 'acc-z']
 for i in range(3):
     #if i==1:
-    	axs[0].plot(time, imu[:,i+1],'.-', label=lab_1[i])
-    	axs[1].plot(time, imu[:,i+4],'.-', label=lab_2[i])
+        axs[0].plot(time, imu[:,i+1],'.-', label=lab_1[i])
+        axs[1].plot(time, imu[:,i+4],'.-', label=lab_2[i])
 for i in range(2):
     #axs[i].set_xlim(386,389)
     axs[i].grid()

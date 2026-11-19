@@ -16,9 +16,9 @@ axs[0,1].set_title('bg')
 axs[1,1].set_title('ba')
 axs[2,1].set_title('Gravity')
 for i in range(1,4):
-	for j in range(6):
+    for j in range(6):
 	    axs[j%3, j//3].plot(time, a_out[:,i+j*3],'.-', label=lab_out[i])
-	for j in range(6):
+    for j in range(6):
 		axs[j%3, j//3].grid()
 		axs[j%3, j//3].legend()
 plt.grid()

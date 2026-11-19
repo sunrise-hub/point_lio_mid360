@@ -1,0 +1,807 @@
+Point-LIO ROS2（Mid-360 Fork）代码说明
+======================================
+
+适用目录：
+  /home/wbw/point_lio/src/9000_point_lio_ros2_Mid-360
+
+适用配置：
+  config/mid360.yaml
+  launch/mapping_mid360.launch.py
+
+说明目的：
+  用“数据如何流动”为主线，说明这个包从传感器输入到里程计/点云输出的完整链路，
+  并说明各文件、目录、关键函数分别负责什么，方便后续改代码和排查问题。
+
+
+一、一句话总览
+==============
+
+Point-LIO 是一个 LiDAR-IMU 里程计（LIO）：
+
+  IMU 高频“猜”运动  +  LiDAR 逐点点到面“纠正”  +  iEKF 融合  +  ikd-Tree 增量地图
+
+本仓库是 Point-LIO 的 ROS2 移植版本，并针对 Livox Mid-360 做了适配。
+Mid-360 使用 Livox 自定义消息 CustomMsg，因为只有 CustomMsg 才带“逐点时间戳”，
+而 Point-LIO 的核心就是按每个点自己的时间做状态预测和量测更新。
+
+
+二、运行入口与外部接口
+======================
+
+1. 启动入口
+
+  ros2 launch point_lio mapping_mid360.launch.py
+
+  该 launch 会：
+    - 加载 config/mid360.yaml
+    - 启动可执行文件 pointlio_mapping（节点名 laserMapping）
+    - 默认同时启动 rviz2，加载 rviz_cfg/loam_livox.rviz
+    - 覆盖几个关键运行参数：
+        use_imu_as_input: False
+        prop_at_freq_of_imu: True
+        check_satu: True
+        init_map_size: 10
+        point_filter_num: 3
+        max_iter: 2
+        space_down_sample: True
+        filter_size_surf: 0.5
+        filter_size_map: 0.5
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: False
+
+2. 订阅话题
+
+  /livox/lidar   livox_ros_driver2/msg/CustomMsg
+                 由 livox_ros_driver2 的 msg_MID360_launch.py 发布
+                 回调：laserMapping.cpp 的 livox_pcl_cbk()
+
+  /livox/imu     sensor_msgs/msg/Imu
+                 Mid-360 内置 IMU
+                 回调：laserMapping.cpp 的 imu_cbk()
+
+  说明：
+    - lidar_type == 1（AVIA/Livox 分支）时订阅 CustomMsg。
+    - 其它雷达类型订阅 sensor_msgs/PointCloud2，走 standard_pcl_cbk()。
+
+3. 发布话题
+
+  /aft_mapped_to_init      nav_msgs/msg/Odometry
+                           世界系 camera_init 下的 IMU/body 位姿与速度
+
+  /cloud_registered        sensor_msgs/msg/PointCloud2
+                           当前帧点云变换到世界系后的结果
+
+  /cloud_registered_body   sensor_msgs/msg/PointCloud2
+                           当前帧点云在 body/IMU 系下的结果
+                           （scan_bodyframe_pub_en=True 时才发布）
+
+  /path                    nav_msgs/msg/Path
+                           轨迹
+
+  /Laser_map               sensor_msgs/msg/PointCloud2
+                           初始化后的地图点云快照
+
+  /odom_corrected          nav_msgs/msg/Odometry
+                           仅当 odom_only=True 时使用，替代 /aft_mapped_to_init
+
+4. TF
+
+  camera_init -> aft_mapped
+
+  camera_init 是启动瞬间建立的世界系，z 轴按重力方向对齐。
+  aft_mapped 是 Point-LIO 输出的 IMU/body 位姿。
+  代码里点云有时叫 body，odom 里叫 aft_mapped，两者物理上是同一个 IMU 刚体，
+  只是命名历史不同。
+
+
+三、数据流主线（最重要）
+========================
+
+整体数据流：
+
+  Livox 驱动
+      │
+      ├─ /livox/lidar (CustomMsg)
+      │       │
+      │       ▼
+      │   livox_pcl_cbk()
+      │       │
+      │       ▼
+      │   Preprocess::avia_handler()
+      │       │  过滤 line/tag、point_filter_num、blind 盲区
+      │       │  把每个点相对帧头的时间写进 curvature（单位 ms）
+      │       ▼
+      │   lidar_buffer / time_buffer
+      │
+      └─ /livox/imu (Imu)
+              │
+              ▼
+          imu_cbk()
+              │  减去 time_lag_imu_to_lidar
+              ▼
+          imu_deque
+
+  然后主循环：
+
+  sync_packages()
+      │  把“一帧 LiDAR + 该帧结束前需要的 IMU”拼成 MeasureGroup
+      ▼
+  ImuProcess::Process()
+      │  前 100 个 IMU 样本：估计重力方向、陀螺零偏
+      │  初始化完成后：把 LiDAR 点云交给 feats_undistort
+      ▼
+  lasermap_fov_segment()
+      │  根据当前位置维护局部地图立方体，删除远离的旧地图块
+      ▼
+  体素下采样 + 按 curvature 排序
+      │  feats_down_body
+      ▼
+  time_compressing()
+      │  把时间戳相同的点分成一组，得到 time_seq
+      ▼
+  ┌───────────────────────────────┐
+  │ init_map == false             │
+  │   累计首帧/前几帧点云          │
+  │   达到 init_map_size 后建树    │
+  │   ikdtree.Build(...)          │
+  └───────────────────────────────┘
+                  │
+                  ▼
+  ┌───────────────────────────────┐
+  │ init_map == true              │
+  │   对每个时间组 k：             │
+  │   1. 用 IMU predict 到该组时间 │
+  │   2. IMU 量测更新（可选）       │
+  │   3. 点变换到世界系             │
+  │   4. 在 ikd-Tree 找 5 近邻      │
+  │   5. 拟合平面，算点到面残差     │
+  │   6. iEKF 迭代更新位姿          │
+  └───────────────────────────────┘
+                  │
+                  ▼
+  map_incremental()
+      │  把当前帧点云变换到世界系后加入 ikd-Tree
+      ▼
+  发布 odom / path / cloud / TF
+      │
+      ├─ /aft_mapped_to_init
+      ├─ /cloud_registered
+      ├─ /cloud_registered_body
+      ├─ /path
+      └─ /Laser_map
+
+
+四、按阶段解释
+==============
+
+阶段 1：LiDAR 回调与预处理
+--------------------------
+
+入口：laserMapping.cpp 的 livox_pcl_cbk()（约 269 行）
+
+做的事情：
+  1. 检查时间戳是否回退。
+  2. 调用 p_pre->process(msg, ptr)，进入 Preprocess::avia_handler()。
+  3. 可选地做 cut_frame（切帧）或 con_frame（拼帧）。
+  4. 把点云放入 lidar_buffer，把帧头时间放入 time_buffer。
+
+Preprocess::avia_handler() 做的事（preprocess.cpp，约 91 行）：
+  - 清空 pl_surf / pl_corn / pl_full。
+  - 只保留 line < N_SCANS 且 tag 满足条件的点。
+  - 每 point_filter_num 个点保留 1 个。
+  - curvature = offset_time / 1000000，即该点相对帧头的时间（ms）。
+  - 用 blind 丢弃雷达原点附近的近距点。
+  - 把保留点放入 pl_surf。
+
+Mid-360 关键点：
+  - scan_line = 6
+  - blind = 0.1 m
+  - point_filter_num = 3（launch 覆盖）
+  - lidar_type = 1，走 CustomMsg 分支
+
+注意：
+  Point-LIO 不使用传统 LOAM 的特征提取（线/面特征）作为 Livox 主路径；
+  Livox 分支直接把原始点送入点到面残差计算，靠逐点时间戳处理运动。
+
+
+阶段 2：IMU 回调与缓冲
+----------------------
+
+入口：laserMapping.cpp 的 imu_cbk()（约 338 行）
+
+做的事情：
+  - 复制 Imu 消息。
+  - 用 time_lag_imu_to_lidar 修正 IMU 时间戳。
+  - 检查时间是否回退。
+  - 放入 imu_deque。
+
+注意：
+  IMU 回调只负责缓存，不在这里做积分。
+  真正的 IMU 预测和 IMU 量测更新在主循环中按点时间推进。
+
+
+阶段 3：同步一帧 LiDAR 和 IMU
+----------------------------
+
+入口：laserMapping.cpp 的 sync_packages()（约 361 行）
+
+输出：MeasureGroup
+  - lidar：这一帧点云
+  - lidar_beg_time：帧头时间
+  - lidar_last_time：帧尾时间
+  - imu：初始化阶段需要的 IMU 样本
+
+关键逻辑：
+  - 如果 LiDAR 帧点数为 0，会打印 “lose lidar” 并丢弃该帧。
+  - 计算该帧最后一个点的时间，得到 lidar_end_time。
+  - 必须等 IMU 数据覆盖到 lidar_end_time，才允许处理该帧。
+  - IMU 初始化阶段会把 IMU 样本放入 MeasureGroup。
+  - 地图初始化完成后，IMU 数据主要由主循环的逐点预测逻辑消费。
+
+
+阶段 4：IMU 初始化
+------------------
+
+入口：src/IMU_Processing.hpp 的 ImuProcess::Process()（约 111 行）
+     以及 ImuProcess::IMU_init()（约 82 行）
+
+做的事情：
+  - 如果 imu_need_init_ == true：
+      * 累计 IMU 样本，估计 mean_acc / mean_gyr。
+      * 默认累计 100 个样本（MAX_INI_COUNT）。
+      * 初始化完成后 imu_need_init_ = false。
+      * 当前帧点云直接拷贝给 feats_undistort。
+  - 如果已经初始化：
+      * 直接拷贝 meas.lidar 给 feats_undistort。
+
+重要说明：
+  这个 fork 的 ImuProcess::Process() 没有做传统意义上的点云去畸变；
+  “feats_undistort” 这个变量名是历史命名。
+  Point-LIO 的抗运动畸变能力来自“逐点时间戳 + 每组点单独 predict + 更新”，
+  不是先做一次整帧去畸变。
+
+重力对齐：
+  main() 在首次处理时会用 p_imu->mean_acc 和 gravity/gravity_init
+  计算初始姿态，使世界系 z 轴与重力方向对齐。
+
+
+阶段 5：局部地图裁剪与下采样
+----------------------------
+
+入口：
+  lasermap_fov_segment()（laserMapping.cpp，约 149 行）
+  体素下采样（laserMapping.cpp，约 903 行）
+
+lasermap_fov_segment()：
+  - 根据当前 LiDAR 位置维护一个立方体局部地图（cube_side_length）。
+  - 当 LiDAR 靠近立方体边缘时，整体平移立方体。
+  - 用 ikdtree.Delete_Point_Boxes() 删除移出局部地图的旧点。
+
+体素下采样：
+  - filter_size_surf 控制当前帧下采样体素大小。
+  - 下采样后按 curvature（逐点时间）排序。
+  - filter_size_map 控制地图增量时的体素大小。
+
+
+阶段 6：建初始地图
+------------------
+
+入口：laserMapping.cpp 约 915 行
+
+做的事情：
+  - 初始 init_map == false。
+  - 每帧把点从 body 系变换到世界系。
+  - 把点累计到 init_feats_world。
+  - 当点数达到 init_map_size（Mid-360 launch 里是 10）后：
+      ikdtree.Build(init_feats_world);
+      init_map = true;
+  - 建图完成后发布一次 /Laser_map。
+
+注意：
+  初始地图建立前不会发布正常里程计；
+  所以启动后需要静止等待初始化完成。
+
+
+阶段 7：逐点/逐组 iEKF 更新
+---------------------------
+
+主循环：laserMapping.cpp 约 828 行开始
+
+核心流程：
+  1. p_imu->Process() 把点云放进 feats_undistort。
+  2. 做重力初始化（如果还没做）。
+  3. 做局部地图裁剪、下采样、按时间排序。
+  4. time_compressing() 把 curvature 相同的点分成一组。
+  5. 对每个时间组 k：
+       - 从上一个时刻 predict 到该组的点时间。
+       - 如果中间有 IMU 样本，就逐条 predict，并做 IMU 量测更新。
+       - 用当前位姿把点从 body 系变换到世界系。
+       - 在 ikd-Tree 中搜索最近 5 个点（NUM_MATCH_POINTS = 5）。
+       - 用这 5 个点拟合平面（esti_plane，plane_thr）。
+       - 计算点到平面残差（h_model_output）。
+       - 用 iEKF 更新位置、姿态、速度、零偏等状态。
+       - 更新后的点再变换到世界系，供地图增量使用。
+
+两种滤波器模式：
+  - use_imu_as_input == False（Mid-360 使用）：
+      * 使用 kf_output，状态 30 维。
+      * 状态里包含 omg、acc，IMU 读数作为量测（h_model_IMU_output）。
+  - use_imu_as_input == True：
+      * 使用 kf_input，状态 24 维。
+      * IMU 作为输入，直接参与状态预测。
+
+状态量：
+  state_output（30 维）：
+    pos, rot, offset_R_L_I, offset_T_L_I, vel, omg, acc, gravity, bg, ba
+  state_input（24 维）：
+    pos, rot, offset_R_L_I, offset_T_L_I, vel, bg, ba, gravity
+  input_ikfom（6 维）：
+    acc, gyro
+
+外参：
+  extrinsic_T / extrinsic_R 表示 LiDAR 在 IMU 坐标系中的位姿。
+  mid360.yaml 中 extrinsic_T = [-0.011, -0.02329, 0.04412]，
+  extrinsic_R = 单位矩阵。
+
+
+阶段 8：地图增量
+----------------
+
+入口：map_incremental()（laserMapping.cpp，约 451 行）
+
+做的事情：
+  - 遍历当前帧下采样后的世界系点。
+  - 用 filter_size_map 对应的体素判断是否需要加入地图。
+  - 调用 ikdtree.Add_Points() 把点加入增量 kd-Tree。
+
+地图结构：
+  ikd-Tree 是增量式 kd-Tree，支持动态插入、删除和最近邻搜索。
+  代码路径：include/ikd-Tree/ikd_Tree.h / ikd_Tree.cpp
+
+
+阶段 9：输出
+------------
+
+入口：
+  publish_odometry()（laserMapping.cpp，约 638 行）
+  publish_path()（约 695 行）
+  publish_frame_world()（约 520 行）
+  publish_frame_body()（约 578 行）
+
+输出内容：
+  - /aft_mapped_to_init：
+      kf_output.x_.pos / rot，twist 为 kf_output.x_.vel / omg。
+  - camera_init -> aft_mapped TF：
+      与 odom 同一份位姿。
+  - /cloud_registered：
+      当前帧点云在世界系下的坐标。
+  - /cloud_registered_body：
+      当前帧点云在 body/IMU 系下的坐标。
+  - /path：
+      轨迹消息。
+  - PCD 保存（可选）：
+      pcd_save_en=true 时保存到 PCD/ 目录。
+      pcd_save_interval=-1 表示最后合成一个 scans.pcd；
+      大于 0 表示每多少帧保存一个 scans_N.pcd。
+
+
+五、思维导图（模块视角）
+========================
+
+Point-LIO ROS2
+│
+├─ 1. 输入层
+│  ├─ /livox/lidar  CustomMsg
+│  │  └─ livox_pcl_cbk()
+│  │     └─ Preprocess::avia_handler()
+│  │        ├─ line / tag 过滤
+│  │        ├─ point_filter_num 抽点
+│  │        ├─ blind 盲区过滤
+│  │        └─ curvature = 逐点相对时间
+│  │     └─ lidar_buffer / time_buffer
+│  │
+│  └─ /livox/imu  Imu
+│     └─ imu_cbk()
+│        └─ time_lag_imu_to_lidar 修正
+│        └─ imu_deque
+│
+├─ 2. 同步层
+│  └─ sync_packages()
+│     └─ MeasureGroup { lidar, lidar_beg_time, lidar_last_time, imu }
+│
+├─ 3. 初始化层
+│  ├─ ImuProcess::IMU_init()
+│  │  └─ 100 个 IMU 样本估计 mean_acc / mean_gyr
+│  ├─ gravity_align
+│  │  └─ 世界系 z 轴对齐重力
+│  └─ 初始地图
+│     └─ 累计点云到 init_map_size
+│     └─ ikdtree.Build()
+│
+├─ 4. 预处理层
+│  ├─ lasermap_fov_segment()
+│  │  └─ 局部地图立方体 + 删除远处地图
+│  ├─ VoxelGrid 下采样
+│  └─ time_compressing()
+│     └─ 按 curvature 分组，得到 time_seq
+│
+├─ 5. 状态估计层
+│  ├─ kf_output / kf_input
+│  │  ├─ predict()
+│  │  ├─ update_iterated_dyn_share_IMU()
+│  │  └─ update_iterated_dyn_share_modified()
+│  ├─ h_model_output()
+│  │  └─ 5 近邻 + 平面拟合 + 点到面残差
+│  └─ h_model_IMU_output()
+│     └─ IMU 量测更新
+│
+├─ 6. 地图层
+│  ├─ ikd-Tree
+│  │  ├─ Build()
+│  │  ├─ Nearest_Search()
+│  │  ├─ Add_Points()
+│  │  └─ Delete_Point_Boxes()
+│  └─ map_incremental()
+│     └─ 当前帧点写入 ikd-Tree
+│
+└─ 7. 输出层
+   ├─ /aft_mapped_to_init
+   ├─ TF camera_init -> aft_mapped
+   ├─ /cloud_registered
+   ├─ /cloud_registered_body
+   ├─ /path
+   ├─ /Laser_map
+   └─ PCD/（可选）
+
+
+六、文件与目录职责
+==================
+
+1. 根目录
+
+  CMakeLists.txt
+    构建脚本。
+    目标：pointlio_mapping
+    源文件：
+      src/laserMapping.cpp
+      src/parameters.cpp
+      src/preprocess.cpp
+      src/Estimator.cpp
+      include/ikd-Tree/ikd_Tree.cpp
+    安装：
+      pointlio_mapping -> lib/point_lio/
+      config、launch、rviz_cfg -> share/point_lio/
+
+  package.xml
+    ROS2 包元数据与依赖声明。
+    主要依赖：rclcpp、nav_msgs、sensor_msgs、tf2_ros、pcl_ros、
+    pcl_conversions、visualization_msgs、livox_ros_driver2。
+
+  README.md
+    上游 Point-LIO 的说明、依赖、编译和运行方法。
+
+  LICENSE
+    开源许可证。
+
+  .gitmodules
+    ikd-Tree 的子模块声明（当前源码已直接放在 include/ikd-Tree 下）。
+
+2. config/
+
+  mid360.yaml
+    Mid-360 当前使用的参数。
+    关键参数：
+      common.lid_topic = /livox/lidar
+      common.imu_topic = /livox/imu
+      preprocess.lidar_type = 1
+      preprocess.scan_line = 6
+      preprocess.blind = 0.1
+      mapping.imu_en = true
+      mapping.extrinsic_est_en = false
+      mapping.extrinsic_T = [-0.011, -0.02329, 0.04412]
+      mapping.extrinsic_R = 单位矩阵
+      mapping.satu_acc = 78.5
+      mapping.satu_gyro = 34.9
+      mapping.acc_norm = 9.81
+      mapping.plane_thr = 0.1
+      mapping.match_s = 81.0
+      publish.path_en = true
+      publish.scan_publish_en = true
+      publish.scan_bodyframe_pub_en = false
+      odometry.publish_odometry_without_downsample = false
+
+  avia.yaml / horizon.yaml / ouster64.yaml / velody16.yaml / unilidar_l1.yaml / unilidar_l2.yaml
+    其它雷达的对应配置。
+
+3. launch/
+
+  mapping_mid360.launch.py
+    Mid-360 启动入口，加载 mid360.yaml，启动 pointlio_mapping 和 RViz。
+
+  mapping_avia.launch.py
+  mapping_horizon.launch.py
+  mapping_ouster64.launch.py
+  mapping_velody16.launch.py
+  mapping_unilidar_l1.launch.py
+  mapping_unilidar_l2.launch.py
+    其它雷达的启动入口。
+
+  correct_odom_unilidar_l1.launch.py
+  correct_odom_unilidar_l2.launch.py
+    设置 odom_only=True，只输出 /odom_corrected，不发布地图/点云/路径。
+
+  gdb_debug_example.launch.py
+    GDB 调试启动示例。
+
+4. rviz_cfg/
+
+  loam_livox.rviz
+    RViz2 配置文件，包含 PointCloud2、Path、TF 等显示项。
+    Fixed Frame 通常为 camera_init。
+
+5. src/
+
+  laserMapping.cpp
+    程序主入口与总调度。
+    主要函数：
+      main()                        程序入口、订阅/发布、主循环
+      livox_pcl_cbk()               Livox CustomMsg 回调
+      standard_pcl_cbk()            PointCloud2 回调
+      imu_cbk()                     IMU 回调
+      sync_packages()               同步一帧 LiDAR + IMU
+      lasermap_fov_segment()        局部地图裁剪
+      map_incremental()             地图增量
+      publish_init_kdtree()         发布初始地图
+      publish_frame_world()         发布世界系点云
+      publish_frame_body()          发布 body 系点云
+      publish_odometry()            发布 odom + TF
+      publish_path()                发布轨迹
+
+  parameters.cpp / parameters.h
+    参数声明、读取和全局变量定义。
+    所有 YAML 参数最终都通过 readParameters() 读入全局变量。
+    包括话题名、滤波参数、外参、输出开关等。
+
+  preprocess.cpp / preprocess.h
+    不同雷达的原始消息适配和点云预处理。
+    主要函数：
+      Preprocess::process(CustomMsg)      Livox 分支
+      Preprocess::process(PointCloud2)    通用 PointCloud2 分支
+      avia_handler()                      Livox CustomMsg 预处理
+      oust64_handler()                    Ouster
+      velodyne_handler()                  Velodyne
+      unilidar_handler()                  Unitree L1/L2
+      hesai_handler()                     Hesai
+      give_feature() / plane_judge() / edge_jump_judge()
+                                         传统特征提取/平面判断辅助逻辑，
+                                         主要服务于非 Livox 分支。
+
+  Estimator.cpp / Estimator.h
+    状态定义、过程模型、量测模型和 iEKF 接口。
+    主要函数/内容：
+      state_input / state_output / input_ikfom
+                                         状态与输入流形定义
+      process_noise_cov_input/output()   过程噪声
+      get_f_input/output()               状态预测函数
+      df_dx_input/output()               状态转移雅可比
+      h_model_input()                    IMU 作为输入时的量测模型
+      h_model_output()                   LiDAR 点到面量测模型
+      h_model_IMU_output()               IMU 量测模型
+      pointBodyToWorld()                 body 系点 -> 世界系点
+      SO3ToEuler()                       SO3 -> 欧拉角
+      time_list()                        按 curvature 时间排序
+
+  IMU_Processing.hpp
+    IMU 初始化与预处理。
+    主要函数：
+      ImuProcess::Reset()
+      ImuProcess::IMU_init()
+      ImuProcess::Process()
+      ImuProcess::Set_init()
+    注意：本 fork 的 Process() 只做初始化和点云传递，不做整帧去畸变。
+
+6. include/
+
+  common_lib.h
+    公共类型和工具。
+    包括：
+      PointType / PointCloudXYZI / PointVector / V3D / M3D
+      MeasureGroup
+      time_compressing()
+      esti_plane() / esti_normvector()
+      get_time_sec() / get_ros_time()
+      NUM_MATCH_POINTS = 5
+
+  so3_math.h
+    SO3 指数/对数、旋转矩阵、欧拉角等数学工具。
+
+  ikd-Tree/
+    增量式 kd-Tree 地图。
+      ikd_Tree.h    接口
+      ikd_Tree.cpp  实现
+    支持 Build、Nearest_Search、Add_Points、Delete_Point_Boxes 等。
+
+  IKFoM/
+    迭代误差状态卡尔曼滤波框架。
+      IKFoM_toolkit/esekfom/esekfom.hpp
+        esekf、predict、update_iterated_dyn_share_modified、
+        update_iterated_dyn_share_IMU 等。
+      IKFoM_toolkit/mtk/
+        SO3、vect、S2 等流形类型和 MTK_BUILD_MANIFOLD 宏。
+
+  FOV_Checker/
+    雷达视场检查工具。
+    当前 CMakeLists.txt 没有把 FOV_Checker.cpp 加入构建，
+    属于遗留/可选模块，当前主流程不依赖它。
+
+7. Log/
+
+  运行/调试输出目录。
+    pos_log.txt       位姿日志
+    mat_out.txt       iEKF 状态量日志
+    imu_pbp.txt       IMU 逐点传播日志
+    plot.py           日志绘图脚本
+    plot_imu.py       IMU 日志绘图脚本
+    plot_out.py       状态量绘图脚本
+  runtime_pos_log_enable=True 时才会写这些日志。
+
+8. PCD/
+
+  地图保存目录。
+    pcd_save_en=True 时保存 scans.pcd 或 scans_N.pcd。
+
+9. image/
+
+  README 使用的图片资源，不参与编译和运行。
+
+
+七、关键状态与坐标约定
+======================
+
+1. 坐标/帧
+
+  camera_init
+    世界系。启动瞬间建立，z 轴按重力方向对齐。
+
+  aft_mapped
+    Point-LIO 输出的 IMU/body 位姿对应的 child frame。
+
+  body
+    点云使用的 IMU/body 系。
+    /cloud_registered_body 的 frame_id 为 body。
+
+  LiDAR 点云原点
+    CustomMsg 中的点坐标所在坐标系。
+    通过 extrinsic_T / extrinsic_R 转到 IMU/body 系。
+
+2. 外参
+
+  extrinsic_T：LiDAR 在 IMU 系中的平移。
+  extrinsic_R：LiDAR 在 IMU 系中的旋转矩阵。
+
+  Mid-360 当前值：
+    extrinsic_T = [-0.011, -0.02329, 0.04412]
+    extrinsic_R = [1,0,0, 0,1,0, 0,0,1]
+
+3. 输出 twist
+
+  /aft_mapped_to_init 的 twist.linear 是 IMU/body 原点速度；
+  twist.angular 是 IMU/body 角速度。
+  如果下游要底盘中心速度，需要自己做杠杆臂补偿。
+
+
+八、初始化与启动时序
+====================
+
+1. 启动 driver：
+
+   source /opt/ros/humble/setup.bash
+   source ~/livox_ws/install/setup.bash
+   ros2 launch livox_ros_driver2 msg_MID360_launch.py
+
+2. 启动 Point-LIO：
+
+   source /opt/ros/humble/setup.bash
+   source ~/livox_ws/install/setup.bash
+   source ~/point_lio/install/setup.bash
+   ros2 launch point_lio mapping_mid360.launch.py
+
+3. 启动后：
+
+   - 前约 100 个 IMU 样本用于初始化（约 0.5 s，200 Hz）。
+   - 初始地图达到 init_map_size 后才开始正常输出。
+   - 初始化期间必须保持静止，否则重力和零偏估计会偏。
+   - 初始化完成后才会出现稳定 odom、path、TF。
+
+4. 验证：
+
+   ros2 topic hz /livox/lidar
+   ros2 topic hz /livox/imu
+   ros2 topic echo /aft_mapped_to_init --once
+   ros2 run tf2_ros tf2_echo camera_init aft_mapped
+
+
+九、已知边界与排查提示
+======================
+
+1. 没有回环检测、没有先验地图、没有重定位。
+   每次启动的 camera_init 原点都不同，轨迹会累积漂移。
+
+2. 没有显式几何退化检测。
+   LiDAR 有效点很少时，滤波仍可能继续更新；点到面量测矩阵可能秩亏。
+   相关代码：
+     Estimator.cpp  h_model_output()
+     IKFoM_toolkit/esekfom/esekfom.hpp  update_iterated_dyn_share_modified()
+
+3. 完全遮挡 LiDAR 时：
+   - 近距点会被 blind=0.1 过滤。
+   - 点云为空时 sync_packages() 会丢弃该帧。
+   - 这段时间没有 LiDAR 修正，IMU 数据会在队列中积压。
+   - 下一帧有效点云到来时，积压 IMU 会被补算，零偏会被二次积分，
+     可能出现明显位置漂移或跳变。
+   相关代码：
+     laserMapping.cpp  sync_packages()
+     laserMapping.cpp  main() 中逐点 predict/update 循环
+     preprocess.cpp    avia_handler()
+
+4. 部分遮挡时，手/手臂/衣物等近距离点可能参与匹配。
+   map_incremental() 当前会把当前帧下采样点写入地图，
+   不区分该点是否通过平面匹配；动态遮挡物可能污染地图。
+   相关代码：
+     laserMapping.cpp  map_incremental()
+     laserMapping.cpp  main() 中 map_incremental() 调用处
+
+5. 没有轮速/编码器接口。
+   遮挡、打滑、雷达脏污时没有第二运动信源。
+
+6. 参数修改入口：
+   - 话题、外参、IMU 饱和值、blind、下采样：config/mid360.yaml
+   - launch 覆盖参数：launch/mapping_mid360.launch.py
+   - 预处理：src/preprocess.cpp
+   - 状态/量测模型：src/Estimator.cpp / Estimator.h
+   - IMU 初始化：src/IMU_Processing.hpp
+   - 主循环/发布：src/laserMapping.cpp
+   - 地图结构：include/ikd-Tree/ikd_Tree.cpp
+
+
+十、最短阅读路线
+================
+
+如果只想快速理解代码，按这个顺序看：
+
+  1. src/laserMapping.cpp  main()               先看整体调度
+  2. src/laserMapping.cpp  livox_pcl_cbk()      看 LiDAR 数据怎么进来
+  3. src/preprocess.cpp    avia_handler()       看点和时间戳怎么处理
+  4. src/laserMapping.cpp  sync_packages()      看 LiDAR/IMU 怎么同步
+  5. src/IMU_Processing.hpp Process()           看 IMU 初始化
+  6. src/laserMapping.cpp  主循环                看下采样、建图、iEKF
+  7. src/Estimator.cpp     h_model_output()     看点云量测怎么算
+  8. include/ikd-Tree       ikd_Tree.cpp        看地图增删和最近邻
+  9. src/laserMapping.cpp  publish_*()          看结果怎么发出去
+
+
+十一、总结
+==========
+
+这个包的核心不是“先提取线面特征再做匹配”，而是：
+
+  用每个 LiDAR 点自己的时间戳，
+  在每个点的时间上推进 IMU 状态，
+  再把点投到世界系，和 ikd-Tree 里的局部地图做点到面匹配，
+  用 iEKF 更新位姿和 IMU 状态，
+  最后把当前帧点加入地图并发布 odom、path、cloud 和 TF。
+
+数据流可以记成：
+
+  Livox 驱动
+    -> 回调
+    -> 预处理
+    -> 缓冲/同步
+    -> IMU 初始化与预测
+    -> 下采样与时间分组
+    -> ikd-Tree 最近邻
+    -> 点到面残差
+    -> iEKF 更新
+    -> 地图增量
+    -> 发布 odom/path/cloud/TF
+
