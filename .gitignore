@@ -1,4 +1,11 @@
-/.idea/
-/cmake-build-debug/
-*.pcd
-/Log/pos_log.csv
+# Git metadata used while the workspace was migrated through Codex.
+/.git_workspace/
+
+# Local Codex and cloud credentials.
+/.agents/
+/.aws/
+/.codex/
+
+# Local session notes and helper scripts.
+/session2.md
+/clean_activity.py
